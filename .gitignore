@@ -43,3 +43,7 @@ cmake-build-debug
 /trunk/ide/srs_clion/cmake_install.cmake
 /trunk/ide/srs_clion/srs
 /trunk/ide/srs_clion/Testing/
+/trunk/ide/srs_clion/out/Ubuntu-22.04/build/linux-release
+/trunk/ide/srs_clion/CMakePresets.json
+/.vs
+/trunk/ide/srs_clion/out
