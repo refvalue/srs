@@ -18,6 +18,7 @@ using namespace std;
 
 #include <srs_kernel_log.hpp>
 #include <srs_kernel_error.hpp>
+#include <srs_kernel_utility.hpp>
 
 // For utest to mock it.
 srs_open_t _srs_open_fn = ::open;
@@ -36,7 +37,7 @@ srs_setvbuf_t _srs_setvbuf_fn = ::setvbuf;
 
 SrsFileWriter::SrsFileWriter()
 {
-    fp_  = NULL;
+    fp_ = NULL;
     buf_ = NULL;
 }
 
@@ -67,48 +68,48 @@ srs_error_t SrsFileWriter::set_iobuf_size(int size)
 srs_error_t SrsFileWriter::open(string p)
 {
     srs_error_t err = srs_success;
-    
+
     if (fp_ != NULL) {
         return srs_error_new(ERROR_SYSTEM_FILE_ALREADY_OPENED, "file %s already opened", p.c_str());
     }
-    
+
     if ((fp_ = _srs_fopen_fn(p.c_str(), "wb")) == NULL) {
         return srs_error_new(ERROR_SYSTEM_FILE_OPENE, "open file %s failed", p.c_str());
     }
-    
+
     path_ = p;
-    
+
     return err;
 }
 
 srs_error_t SrsFileWriter::open_append(string p)
 {
     srs_error_t err = srs_success;
-    
+
     if (fp_ != NULL) {
         return srs_error_new(ERROR_SYSTEM_FILE_ALREADY_OPENED, "file %s already opened", p.c_str());
     }
-    
+
     if ((fp_ = _srs_fopen_fn(p.c_str(), "ab")) == NULL) {
         return srs_error_new(ERROR_SYSTEM_FILE_OPENE, "open file %s failed", p.c_str());
     }
-    
+
     path_ = p;
-    
+
     return err;
 }
 
 void SrsFileWriter::close()
 {
-    if (fp_ ==  NULL) {
+    if (fp_ == NULL) {
         return;
     }
-    
+
     if (_srs_fclose_fn(fp_) < 0) {
         srs_warn("close file %s failed", path_.c_str());
     }
     fp_ = NULL;
-    
+
     return;
 }
 
@@ -139,7 +140,7 @@ srs_error_t SrsFileWriter::write(void* buf, size_t count, ssize_t* pnwrite)
     if (fp_ == NULL) {
         return srs_error_new(ERROR_SYSTEM_FILE_NOT_OPEN, "file %s is not opened", path_.c_str());
     }
-    
+
     size_t n = _srs_fwrite_fn(buf, 1, count, fp_);
     if (n != count) {
         return srs_error_new(ERROR_SYSTEM_FILE_WRITE, "write to file %s failed", path_.c_str());
@@ -155,7 +156,7 @@ srs_error_t SrsFileWriter::write(void* buf, size_t count, ssize_t* pnwrite)
 srs_error_t SrsFileWriter::writev(const iovec* iov, int iovcnt, ssize_t* pnwrite)
 {
     srs_error_t err = srs_success;
-    
+
     ssize_t nwrite = 0;
     for (int i = 0; i < iovcnt; i++) {
         const iovec* piov = iov + i;
@@ -214,33 +215,33 @@ SrsFileReader::~SrsFileReader()
 srs_error_t SrsFileReader::open(string p)
 {
     srs_error_t err = srs_success;
-    
+
     if (fd > 0) {
         return srs_error_new(ERROR_SYSTEM_FILE_ALREADY_OPENED, "file %s already opened", path.c_str());
     }
-    
+
     if ((fd = _srs_open_fn(p.c_str(), O_RDONLY)) < 0) {
         return srs_error_new(ERROR_SYSTEM_FILE_OPENE, "open file %s failed", p.c_str());
     }
-    
+
     path = p;
-    
+
     return err;
 }
 
 void SrsFileReader::close()
 {
     int ret = ERROR_SUCCESS;
-    
+
     if (fd < 0) {
         return;
     }
-    
+
     if (_srs_close_fn(fd) < 0) {
         srs_warn("close file %s failed. ret=%d", path.c_str(), ret);
     }
     fd = -1;
-    
+
     return;
 }
 
@@ -269,17 +270,17 @@ int64_t SrsFileReader::filesize()
 {
     int64_t cur = tellg();
     int64_t size = (int64_t)_srs_lseek_fn(fd, 0, SEEK_END);
-    
+
     off_t r0 = _srs_lseek_fn(fd, (off_t)cur, SEEK_SET);
     srs_assert(r0 != -1);
-    
+
     return size;
 }
 
 srs_error_t SrsFileReader::read(void* buf, size_t count, ssize_t* pnread)
 {
     srs_error_t err = srs_success;
-    
+
     ssize_t nread;
     // TODO: FIXME: use st_read.
 #ifdef _WIN32
@@ -289,29 +290,59 @@ srs_error_t SrsFileReader::read(void* buf, size_t count, ssize_t* pnread)
 #endif
         return srs_error_new(ERROR_SYSTEM_FILE_READ, "read from file %s failed", path.c_str());
     }
-    
+
     if (nread == 0) {
         return srs_error_new(ERROR_SYSTEM_FILE_EOF, "file EOF");
     }
-    
+
     if (pnread != NULL) {
         *pnread = nread;
     }
-    
+
     return err;
 }
 
-srs_error_t SrsFileReader::lseek(off_t offset, int whence, off_t* seeked)
+srs_error_t SrsFileReader::lseek(off_t offset, int whence, off_t * seeked)
 {
     off_t sk = _srs_lseek_fn(fd, offset, whence);
     if (sk < 0) {
         return srs_error_new(ERROR_SYSTEM_FILE_SEEK, "seek %d failed", (int)sk);
     }
-    
+
     if (seeked) {
         *seeked = sk;
     }
-    
+
     return srs_success;
 }
 
+srs_error_t srs_get_lines(SrsFileReader * reader, std::vector<std::string>&result)
+{
+    static constexpr std::size_t BUFFER_SIZE{4096};
+    static const std::vector<std::string> DELIMS{"\r\n", "\n"};
+
+    ssize_t bytes_read{};
+    srs_error_t err = srs_success;
+    std::string buffer(BUFFER_SIZE, '\0');
+
+    result.clear();
+
+    while ((err = reader->read(&buffer.front(), buffer.size(), &bytes_read)) == srs_success && bytes_read > 0) {
+        auto lines = srs_string_split(buffer.substr(0, bytes_read), DELIMS);
+        auto iter = lines.begin();
+
+        if (!result.empty()) {
+            result.back().append(lines.front());
+            ++iter;
+        }
+
+        std::copy(iter, lines.end(), std::back_inserter(result));
+    }
+
+    // EOF is not a real error.
+    if (srs_error_code(err) == ERROR_SYSTEM_FILE_EOF) {
+        srs_error_reset(err);
+    }
+
+    return err;
+}

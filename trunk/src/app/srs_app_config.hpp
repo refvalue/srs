@@ -492,6 +492,12 @@ public:
     virtual srs_utime_t get_stream_caster_sip_reinvite(SrsConfDirective* conf);
     // Get the candidate for SDP.
     virtual std::string get_stream_caster_sip_candidate(SrsConfDirective* conf);
+    // Get whether the sip.authentication is enabled.
+    virtual bool get_stream_caster_sip_authentication(SrsConfDirective* conf);
+    // Get the realm for sip.authentication.
+    virtual std::string get_stream_caster_sip_realm(SrsConfDirective* conf);
+    // Get the path of the user htdigest file for sip.authentication.
+    virtual std::string get_stream_caster_sip_user_htdigest_file(SrsConfDirective* conf);
 // rtc section
 public:
     virtual bool get_rtc_server_enabled();

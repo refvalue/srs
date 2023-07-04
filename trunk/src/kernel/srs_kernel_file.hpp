@@ -12,6 +12,7 @@
 #include <srs_kernel_io.hpp>
 
 #include <string>
+#include <vector>
 
 // for srs-librtmp, @see https://github.com/ossrs/srs/issues/213
 #ifndef _WIN32
@@ -126,6 +127,8 @@ typedef int (*srs_fseek_t)(FILE* stream, long offset, int whence);
 typedef int (*srs_fclose_t)(FILE* stream);
 typedef long (*srs_ftell_t)(FILE* stream);
 typedef int (*srs_setvbuf_t)(FILE* stream, char* buf, int type, size_t size);
+
+srs_error_t srs_get_lines(SrsFileReader* reader, std::vector<std::string>& result);
 
 #endif
 

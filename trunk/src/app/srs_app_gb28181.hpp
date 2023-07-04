@@ -39,6 +39,9 @@ class SrsRawH264Stream;
 class SrsSharedPtrMessage;
 class SrsPithyPrint;
 class SrsRawAacStream;
+class ISrsSipHandler;
+class SrsSipAuth;
+class SrsRfc2617Auth;
 
 // The state machine for GB session.
 // init:
@@ -77,6 +80,7 @@ std::string srs_gb_session_state(SrsGbSessionState state);
 enum SrsGbSipState
 {
     SrsGbSipStateInit = 0,
+    SrsGbSipStateUnauthorized,
     SrsGbSipStateRegistered,
     SrsGbSipStateInviting,
     SrsGbSipStateTrying,
@@ -146,10 +150,10 @@ public:
     void on_media_transport(SrsLazyObjectWrapper<SrsLazyGbMediaTcpConn>* media);
     // Get the candidate for SDP generation, the public IP address for device to connect to.
     std::string pip();
-// Interface ISrsStartable
+    // Interface ISrsStartable
 public:
     virtual srs_error_t start();
-// Interface ISrsOneCycleThreadHandler
+    // Interface ISrsOneCycleThreadHandler
 public:
     virtual srs_error_t cycle();
 private:
@@ -157,7 +161,7 @@ private:
     srs_error_t drive_state();
 private:
     SrsGbSessionState set_state(SrsGbSessionState v);
-// Interface ISrsResource
+    // Interface ISrsResource
 public:
     virtual const SrsContextId& get_id();
     virtual std::string desc();
@@ -177,7 +181,7 @@ public:
     srs_error_t initialize(SrsConfDirective* conf);
     srs_error_t listen();
     void close();
-// Interface ISrsTcpHandler
+    // Interface ISrsTcpHandler
 public:
     virtual srs_error_t on_tcp_client(ISrsListener* listener, srs_netfd_t stfd);
 };
@@ -191,6 +195,7 @@ private:
     SrsLazyObjectWrapper<SrsLazyGbSession>* session_;
     SrsSipMessage* register_;
     SrsSipMessage* invite_ok_;
+    SrsSipAuth* auth_;
 private:
     std::string ssrc_str_;
     uint32_t ssrc_v_;
@@ -220,12 +225,13 @@ private:
     void query_ports(int* sip, int* media);
 public:
     // When got a SIP message.
-    srs_error_t on_sip_message(SrsSipMessage* msg);
+    srs_error_t on_sip_message(SrsSipMessage* msg, ISrsHttpMessage* raw_msg);
     // Enqueue a SIP message to send, which might be a request or response.
     void enqueue_sip_message(SrsSipMessage* msg);
 private:
     void drive_state(SrsSipMessage* msg);
-    void register_response(SrsSipMessage* msg);
+    void process_auth(SrsSipMessage* msg, ISrsHttpMessage* raw_msg);
+    void register_response(SrsSipMessage* msg, http_status status);
     void message_response(SrsSipMessage* msg, http_status status);
     void invite_ack(SrsSipMessage* msg);
     void bye_response(SrsSipMessage* msg);
@@ -244,16 +250,18 @@ public:
     bool is_stable();
     // Whether SIP is bye bye.
     bool is_bye();
+    // Enable the REGISTER authorization.
+    srs_error_t set_auth_enabled(bool enabled);
 private:
     SrsGbSipState set_state(SrsGbSipState v);
-// Interface ISrsResource
+    // Interface ISrsResource
 public:
     virtual const SrsContextId& get_id();
     virtual std::string desc();
-// Interface ISrsStartable
+    // Interface ISrsStartable
 public:
     virtual srs_error_t start();
-// Interface ISrsOneCycleThreadHandler
+    // Interface ISrsOneCycleThreadHandler
 public:
     virtual srs_error_t cycle();
 private:
@@ -278,10 +286,10 @@ public:
     void interrupt();
     // Set the cid of all coroutines.
     virtual void set_cid(const SrsContextId& cid);
-// Interface ISrsStartable
+    // Interface ISrsStartable
 public:
     virtual srs_error_t start();
-// Interface ISrsOneCycleThreadHandler
+    // Interface ISrsOneCycleThreadHandler
 public:
     virtual srs_error_t cycle();
 private:
@@ -307,10 +315,10 @@ public:
     void interrupt();
     // Set the cid of all coroutines.
     virtual void set_cid(const SrsContextId& cid);
-// Interface ISrsStartable
+    // Interface ISrsStartable
 public:
     virtual srs_error_t start();
-// Interface ISrsOneCycleThreadHandler
+    // Interface ISrsOneCycleThreadHandler
 public:
     virtual srs_error_t cycle();
 private:
@@ -357,19 +365,19 @@ public:
     void interrupt();
     // Set the cid of all coroutines.
     virtual void set_cid(const SrsContextId& cid);
-// Interface ISrsResource
+    // Interface ISrsResource
 public:
     virtual const SrsContextId& get_id();
     virtual std::string desc();
-// Interface ISrsStartable
+    // Interface ISrsStartable
 public:
     virtual srs_error_t start();
-// Interface ISrsOneCycleThreadHandler
+    // Interface ISrsOneCycleThreadHandler
 public:
     virtual srs_error_t cycle();
 private:
     virtual srs_error_t do_cycle();
-// Interface ISrsPsPackHandler
+    // Interface ISrsPsPackHandler
 public:
     virtual srs_error_t on_ps_pack(SrsPsPacket* ps, const std::vector<SrsTsMessage*>& msgs);
 private:
@@ -441,7 +449,7 @@ class SrsSipResponseWriter : public SrsHttpResponseWriter
 public:
     SrsSipResponseWriter(ISrsProtocolReadWriter* io);
     virtual ~SrsSipResponseWriter();
-// Interface ISrsHttpFirstLineWriter
+    // Interface ISrsHttpFirstLineWriter
 public:
     virtual srs_error_t build_first_line(std::stringstream& ss, char* data, int size);
 };
@@ -452,9 +460,29 @@ class SrsSipRequestWriter : public SrsHttpRequestWriter
 public:
     SrsSipRequestWriter(ISrsProtocolReadWriter* io);
     virtual ~SrsSipRequestWriter();
-// Interface ISrsHttpFirstLineWriter
+    // Interface ISrsHttpFirstLineWriter
 public:
     virtual srs_error_t build_first_line(std::stringstream& ss, char* data, int size);
+};
+
+// Handle SIP message like ISrsHttpHandler, via ISrsHttpMessage as input (raw message) and SrsSipMessage as output.
+class ISrsSipHandler
+{
+public:
+    ISrsSipHandler();
+    virtual ~ISrsSipHandler();
+    virtual srs_error_t serve_sip(SrsSipMessage* m, ISrsHttpMessage* r) = 0;
+};
+
+class SrsSipAuth : public ISrsSipHandler
+{
+public:
+    SrsSipAuth();
+    virtual ~SrsSipAuth();
+    virtual srs_error_t initialize(bool enabled, std::string realm, std::string htdigest_file);
+    virtual srs_error_t serve_sip(SrsSipMessage* m, ISrsHttpMessage* r) override;
+protected:
+    SrsRfc2617Auth* impl_;
 };
 
 // SIP message, covert with HTTP message.
@@ -528,6 +556,9 @@ public:
     // The content type.
     std::string content_type_;
 public:
+    std::string authorization_;
+    std::string www_authenticate_;
+public:
     // SIP message body.
     std::string body_;
     // Escape \r to \\r, \n to \\n.
@@ -550,6 +581,9 @@ private:
 public:
     bool is_register() {
         return type_ == HTTP_REQUEST && method_ == HTTP_REGISTER;
+    }
+    bool is_register_ok() {
+        return type_ == HTTP_RESPONSE && cseq_method_ == "REGISTER" && status_ == HTTP_STATUS_OK;
     }
     bool is_message() {
         return type_ == HTTP_REQUEST && method_ == HTTP_MESSAGE;
@@ -622,7 +656,7 @@ public:
     virtual ~SrsPackContext();
 private:
     void clear();
-// Interface ISrsPsMessageHandler
+    // Interface ISrsPsMessageHandler
 public:
     virtual srs_error_t on_ts_message(SrsTsMessage* msg);
     virtual void on_recover_mode(int nn_recover);

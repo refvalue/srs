@@ -20,6 +20,24 @@ class SrsBitBuffer;
 #define srs_min(a, b) (((a) < (b))? (a) : (b))
 #define srs_max(a, b) (((a) < (b))? (b) : (a))
 
+enum SrsDigestMode
+{
+    SrsDigestModeSha1,
+    SrsDigestModeSha224,
+    SrsDigestModeSha256,
+    SrsDigestModeSha384,
+    SrsDigestModeSha512,
+    SrsDigestModeSha512_224,
+    SrsDigestModeSha512_256,
+    SrsDigestModeSha3_224,
+    SrsDigestModeSha3_256,
+    SrsDigestModeSha3_384,
+    SrsDigestModeSha3_512,
+    SrsDigestModeShake128,
+    SrsDigestModeShake256,
+    SrsDigestModeMd5,
+};
+
 // To read H.264 NALU uev.
 extern srs_error_t srs_avc_nalu_read_uev(SrsBitBuffer* stream, int32_t& v);
 extern srs_error_t srs_avc_nalu_read_bit(SrsBitBuffer* stream, int8_t& v);
@@ -91,6 +109,8 @@ extern std::string srs_string_min_match(std::string str, std::vector<std::string
 // Split the string by seperator to array.
 extern std::vector<std::string> srs_string_split(std::string s, std::string seperator);
 extern std::vector<std::string> srs_string_split(std::string s, std::vector<std::string> seperators);
+// Compare two strings ignoring the letter case.
+extern bool srs_string_icase_compare(std::string s1, std::string s2);
 // Format to a string.
 extern std::string srs_fmt(const char* fmt, ...);
 
@@ -158,6 +178,13 @@ extern int srs_chunk_header_c0(int perfer_cid, uint32_t timestamp, int32_t paylo
 // @param nb_cache, the size of cache.
 // @return the size of header. 0 if cache not enough.
 extern int srs_chunk_header_c3(int perfer_cid, uint32_t timestamp, char* cache, int nb_cache);
+
+// Digest a string.
+// @param mode, the diegst mode.
+// @param buffer, the string.
+// @param result, the result variable containing the hexadecimal digest string.
+// @return the error object.
+extern srs_error_t make_digest(SrsDigestMode mode, std::string buffer, std::string& result);
 
 // For utest to mock it.
 #include <sys/time.h>

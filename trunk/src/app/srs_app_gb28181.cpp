@@ -22,8 +22,13 @@
 #include <srs_app_pithy_print.hpp>
 #include <srs_app_rtmp_conn.hpp>
 #include <srs_protocol_raw_avc.hpp>
+#include <srs_kernel_file.hpp>
+#include <srs_protocol_rfc2617.hpp>
 
 #include <sstream>
+#include <regex>
+#include <algorithm>
+
 using namespace std;
 
 // See https://www.ietf.org/rfc/rfc3261.html#section-8.1.1.7
@@ -39,10 +44,10 @@ extern bool srs_is_rtcp(const uint8_t* data, size_t len);
 std::string srs_gb_session_state(SrsGbSessionState state)
 {
     switch (state) {
-        case SrsGbSessionStateInit: return "Init";
-        case SrsGbSessionStateConnecting: return "Connecting";
-        case SrsGbSessionStateEstablished: return "Established";
-        default: return "Invalid";
+    case SrsGbSessionStateInit: return "Init";
+    case SrsGbSessionStateConnecting: return "Connecting";
+    case SrsGbSessionStateEstablished: return "Established";
+    default: return "Invalid";
     }
 }
 
@@ -54,14 +59,15 @@ std::string srs_gb_state(SrsGbSessionState ostate, SrsGbSessionState state)
 std::string srs_gb_sip_state(SrsGbSipState state)
 {
     switch (state) {
-        case SrsGbSipStateInit: return "Init";
-        case SrsGbSipStateRegistered: return "Registered";
-        case SrsGbSipStateInviting: return "Inviting";
-        case SrsGbSipStateTrying: return "Trying";
-        case SrsGbSipStateStable: return "Stable";
-        case SrsGbSipStateReinviting: return "Re-inviting";
-        case SrsGbSipStateBye: return "Bye";
-        default: return "Invalid";
+    case SrsGbSipStateInit: return "Init";
+    case SrsGbSipStateUnauthorized: return "Unauthorized";
+    case SrsGbSipStateRegistered: return "Registered";
+    case SrsGbSipStateInviting: return "Inviting";
+    case SrsGbSipStateTrying: return "Trying";
+    case SrsGbSipStateStable: return "Stable";
+    case SrsGbSipStateReinviting: return "Re-inviting";
+    case SrsGbSipStateBye: return "Bye";
+    default: return "Invalid";
     }
 }
 
@@ -263,9 +269,11 @@ srs_error_t SrsLazyGbSession::cycle()
     // TODO: FIXME: Only reset the error when client closed it.
     if (srs_is_client_gracefully_close(err)) {
         srs_warn("client disconnect peer. ret=%d", srs_error_code(err));
-    } else if (srs_is_server_gracefully_close(err)) {
+    }
+    else if (srs_is_server_gracefully_close(err)) {
         srs_warn("server disconnect. ret=%d", srs_error_code(err));
-    } else {
+    }
+    else {
         srs_error("serve error %s", srs_error_desc(err).c_str());
     }
 
@@ -313,7 +321,7 @@ srs_error_t SrsLazyGbSession::drive_state()
 {
     srs_error_t err = srs_success;
 
-    #define SRS_GB_CHANGE_STATE_TO(state) { \
+#define SRS_GB_CHANGE_STATE_TO(state) { \
         SrsGbSessionState ostate = set_state(state); \
         srs_trace("Session: Change device=%s, state=%s", sip_->resource()->device_id().c_str(), \
             srs_gb_state(ostate, state_).c_str()); \
@@ -472,7 +480,8 @@ srs_error_t SrsGbListener::on_tcp_client(ISrsListener* listener, srs_netfd_t stf
         }
 
         _srs_gb_manager->add(conn, NULL);
-    } else if (listener == media_listener_) {
+    }
+    else if (listener == media_listener_) {
         SrsLazyObjectWrapper<SrsLazyGbMediaTcpConn>* conn = new SrsLazyObjectWrapper<SrsLazyGbMediaTcpConn>();
         SrsLazyGbMediaTcpConn* resource = dynamic_cast<SrsLazyGbMediaTcpConn*>(conn->resource());
         resource->setup(stfd);
@@ -483,7 +492,8 @@ srs_error_t SrsGbListener::on_tcp_client(ISrsListener* listener, srs_netfd_t stf
         }
 
         _srs_gb_manager->add(conn, NULL);
-    } else {
+    }
+    else {
         srs_warn("GB: Ignore TCP client");
         srs_close_stfd(stfd);
     }
@@ -498,6 +508,7 @@ SrsLazyGbSipTcpConn::SrsLazyGbSipTcpConn(SrsLazyObjectWrapper<SrsLazyGbSipTcpCon
     state_ = SrsGbSipStateInit;
     register_ = new SrsSipMessage();
     invite_ok_ = new SrsSipMessage();
+    auth_ = new SrsSipAuth();
     ssrc_v_ = 0;
 
     conf_ = NULL;
@@ -520,6 +531,7 @@ SrsLazyGbSipTcpConn::~SrsLazyGbSipTcpConn()
     srs_freep(register_);
     srs_freep(invite_ok_);
     srs_freep(conf_);
+    srs_freep(auth_);
 }
 
 void SrsLazyGbSipTcpConn::setup(SrsConfDirective* conf, SrsTcpListener* sip, SrsTcpListener* media, srs_netfd_t stfd)
@@ -553,7 +565,7 @@ void SrsLazyGbSipTcpConn::query_ports(int* sip, int* media)
     if (media) *media = media_listener_->port();
 }
 
-srs_error_t SrsLazyGbSipTcpConn::on_sip_message(SrsSipMessage* msg)
+srs_error_t SrsLazyGbSipTcpConn::on_sip_message(SrsSipMessage* msg, ISrsHttpMessage* raw_msg)
 {
     srs_error_t err = srs_success;
 
@@ -579,22 +591,32 @@ srs_error_t SrsLazyGbSipTcpConn::on_sip_message(SrsSipMessage* msg)
 
     // Notify session about the SIP message.
     if (msg->is_register()) {
-        register_response(msg); // Response for REGISTER.
-    } else if (msg->is_message()) {
+        if (state_ == SrsGbSipStateUnauthorized) {
+            process_auth(msg, raw_msg); // Response for REGISTER AUTH.
+        }
+        else {
+            register_response(msg, HTTP_STATUS_OK); // Response for REGISTER.
+        }
+    }
+    else if (msg->is_message()) {
         // Response for MESSAGE, the heartbeat message.
         // Set 403 to require client register, see https://www.ietf.org/rfc/rfc3261.html#section-21.4
         // Please note that it does not work for GB device, which just ignore 4xx packets like no response.
         message_response(msg, (state_ == SrsGbSipStateInit ? HTTP_STATUS_FORBIDDEN : HTTP_STATUS_OK));
-    } else if (msg->is_invite_ok()) {
+    }
+    else if (msg->is_invite_ok()) {
         srs_freep(invite_ok_);
         invite_ok_ = msg->copy(); // Cache the invite ok message.
         invite_ack(msg); // Response for INVITE OK.
-    } else if (msg->is_bye()) {
+    }
+    else if (msg->is_bye()) {
         bye_response(msg); // Response for Bye OK.
-    } else if (msg->is_trying() || msg->is_bye_ok()) {
+    }
+    else if (msg->is_trying() || msg->is_bye_ok()) {
         // Ignore SIP message 100(Trying).
         // Ignore BYE ok.
-    } else {
+    }
+    else {
         srs_warn("SIP: Ignore message type=%d, status=%d, method=%d, body=%s", msg->type_,
             msg->status_, msg->method_, msg->body_escaped_.c_str());
     }
@@ -615,7 +637,7 @@ void SrsLazyGbSipTcpConn::drive_state(SrsSipMessage* msg)
 {
     srs_error_t err = srs_success;
 
-    #define SRS_GB_SIP_CHANGE_STATE_TO(state) { \
+#define SRS_GB_SIP_CHANGE_STATE_TO(state) { \
         SrsGbSipState ostate = set_state(state); \
         srs_trace("SIP: Change device=%s, state=%s", register_->device_id().c_str(), \
             srs_sip_state(ostate, state_).c_str()); \
@@ -627,12 +649,21 @@ void SrsLazyGbSipTcpConn::drive_state(SrsSipMessage* msg)
     //srs_trace("SIP: Got message type=%s, method=%s, status=%d, expire=%d", mt, mm, ms, msg->expires_);
 
     if (state_ == SrsGbSipStateInit) {
-        // The register message, we will invite it automatically.
-        if (msg->is_register() && msg->expires_ > 0) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateRegistered);
+        // The register message, we will invite it automatically if the device is authorized.
+        if (msg->is_register() && msg->expires_ > 0) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateUnauthorized);
         // Client bye or unregister, we should destroy the session because it might never publish again.
         if (msg->is_register() && msg->expires_ == 0) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateBye);
         // When got heartbeat message, we restore to stable state.
         if (msg->is_message()) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateStable);
+    }
+
+    // Processing SIP AUTH.
+    if (state_ == SrsGbSipStateUnauthorized) {
+        if (msg->is_register_ok()) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateRegistered);
+
+        // Client bye or unregister, we should destroy the session because it might never publish again.
+        if (msg->is_register() && msg->expires_ == 0) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateBye);
+        if (msg->is_bye()) SRS_GB_SIP_CHANGE_STATE_TO(SrsGbSipStateBye);
     }
 
     if (state_ == SrsGbSipStateRegistered) {
@@ -668,12 +699,22 @@ void SrsLazyGbSipTcpConn::drive_state(SrsSipMessage* msg)
     }
 }
 
-void SrsLazyGbSipTcpConn::register_response(SrsSipMessage* msg)
+void SrsLazyGbSipTcpConn::process_auth(SrsSipMessage* msg, ISrsHttpMessage* raw_msg)
+{
+    if (auth_->serve_sip(msg, raw_msg) != srs_success) {
+        return register_response(msg, HTTP_STATUS_UNAUTHORIZED);
+    }
+
+    register_response(msg, HTTP_STATUS_OK);
+}
+
+void SrsLazyGbSipTcpConn::register_response(SrsSipMessage* msg, http_status status)
 {
     SrsSipMessage* res = new SrsSipMessage();
 
     res->type_ = HTTP_RESPONSE;
-    res->status_ = HTTP_STATUS_OK;
+    res->cseq_method_ = "REGISTER";
+    res->status_ = status;
     res->via_ = msg->via_;
     res->from_ = msg->from_;
     res->to_ = msg->to_;
@@ -681,6 +722,7 @@ void SrsLazyGbSipTcpConn::register_response(SrsSipMessage* msg)
     res->call_id_ = msg->call_id_;
     res->contact_ = msg->contact_;
     res->expires_ = msg->expires_;
+    res->www_authenticate_ = msg->www_authenticate_;
 
     enqueue_sip_message(res);
 }
@@ -772,7 +814,7 @@ srs_error_t SrsLazyGbSipTcpConn::invite_request(uint32_t* pssrc)
     string branch = srs_random_str(6);
     string tag = srs_random_str(8);
     string call_id = srs_random_str(16);
-    int cseq = (int)(srs_random()%1000); // TODO: FIXME: Increase.
+    int cseq = (int)(srs_random() % 1000); // TODO: FIXME: Increase.
 
     SrsSdp local_sdp;
     local_sdp.version_ = "0";
@@ -865,6 +907,21 @@ bool SrsLazyGbSipTcpConn::is_bye()
     return state_ == SrsGbSipStateBye;
 }
 
+srs_error_t SrsLazyGbSipTcpConn::set_auth_enabled(bool enabled)
+{
+    srs_error_t err = srs_success;
+
+    // initialize the auth, which will proxy to mux.
+    if ((err = auth_->initialize(enabled,
+        _srs_config->get_stream_caster_sip_realm(conf_),
+        _srs_config->get_stream_caster_sip_user_htdigest_file(conf_))) != srs_success) {
+
+        return srs_error_wrap(err, "init auth");
+    }
+
+    return err;
+}
+
 SrsGbSipState SrsLazyGbSipTcpConn::set_state(SrsGbSipState v)
 {
     SrsGbSipState state = state_;
@@ -896,6 +953,11 @@ srs_error_t SrsLazyGbSipTcpConn::start()
 
     if ((err = sender_->start()) != srs_success) {
         return srs_error_wrap(err, "sender");
+    }
+
+    auto auth_enabled = _srs_config->get_stream_caster_sip_authentication(conf_);
+    if ((err = set_auth_enabled(auth_enabled)) != srs_success) {
+        return srs_error_wrap(err, "set auth");
     }
 
     return err;
@@ -931,9 +993,11 @@ srs_error_t SrsLazyGbSipTcpConn::cycle()
     // TODO: FIXME: Only reset the error when client closed it.
     if (srs_is_client_gracefully_close(err)) {
         srs_warn("client disconnect peer. ret=%d", srs_error_code(err));
-    } else if (srs_is_server_gracefully_close(err)) {
+    }
+    else if (srs_is_server_gracefully_close(err)) {
         srs_warn("server disconnect. ret=%d", srs_error_code(err));
-    } else {
+    }
+    else {
         srs_error("serve error %s", srs_error_desc(err).c_str());
     }
 
@@ -1082,7 +1146,7 @@ srs_error_t SrsLazyGbSipTcpReceiver::do_cycle()
             srs_freep(err); continue;
         }
 
-        if ((err = sip_->on_sip_message(&smsg)) != srs_success) {
+        if ((err = sip_->on_sip_message(&smsg, hmsg)) != srs_success) {
             srs_warn("SIP: Ignore on msg err %s", srs_error_desc(err).c_str());
             srs_freep(err); continue;
         }
@@ -1174,15 +1238,17 @@ srs_error_t SrsLazyGbSipTcpSender::do_cycle()
             res.header()->set("Call-ID", msg->call_id_);
             res.header()->set("User-Agent", RTMP_SIG_SRS_SERVER);
             if (!msg->contact_.empty()) res.header()->set("Contact", msg->contact_);
+            if (!msg->www_authenticate_.empty()) res.header()->set("WWW-Authenticate", msg->www_authenticate_);
             if (msg->expires_ != UINT32_MAX) res.header()->set("Expires", srs_int2str(msg->expires_));
 
             res.header()->set_content_length(msg->body_.length());
             res.write_header(msg->status_);
-            if (!msg->body_.empty()) res.write((char*) msg->body_.c_str(), msg->body_.length());
+            if (!msg->body_.empty()) res.write((char*)msg->body_.c_str(), msg->body_.length());
             if ((err = res.final_request()) != srs_success) {
                 return srs_error_wrap(err, "response");
             }
-        } else if (msg->type_ == HTTP_REQUEST) {
+        }
+        else if (msg->type_ == HTTP_REQUEST) {
             SrsSipRequestWriter req(conn_);
             req.header()->set("Via", msg->via_);
             req.header()->set("From", msg->from_);
@@ -1192,16 +1258,18 @@ srs_error_t SrsLazyGbSipTcpSender::do_cycle()
             req.header()->set("User-Agent", RTMP_SIG_SRS_SERVER);
             if (!msg->contact_.empty()) req.header()->set("Contact", msg->contact_);
             if (!msg->subject_.empty()) req.header()->set("Subject", msg->subject_);
+            if (!msg->authorization_.empty()) req.header()->set("Authorization", msg->authorization_);
             if (msg->max_forwards_) req.header()->set("Max-Forwards", srs_int2str(msg->max_forwards_));
 
             if (!msg->content_type_.empty()) req.header()->set_content_type(msg->content_type_);
             req.header()->set_content_length(msg->body_.length());
             req.write_header(http_method_str(msg->method_), msg->request_uri_);
-            if (!msg->body_.empty()) req.write((char*) msg->body_.c_str(), msg->body_.length());
+            if (!msg->body_.empty()) req.write((char*)msg->body_.c_str(), msg->body_.length());
             if ((err = req.final_request()) != srs_success) {
                 return srs_error_wrap(err, "request");
             }
-        } else {
+        }
+        else {
             srs_warn("SIP: Sender drop message type=%d, method=%s, body=%dB", msg->type_,
                 http_method_str(msg->method_), msg->body_.length());
         }
@@ -1316,9 +1384,11 @@ srs_error_t SrsLazyGbMediaTcpConn::cycle()
     // TODO: FIXME: Only reset the error when client closed it.
     if (srs_is_client_gracefully_close(err)) {
         srs_warn("client disconnect peer. ret=%d", srs_error_code(err));
-    } else if (srs_is_server_gracefully_close(err)) {
+    }
+    else if (srs_is_server_gracefully_close(err)) {
         srs_warn("server disconnect. ret=%d", srs_error_code(err));
-    } else {
+    }
+    else {
         srs_error("serve error %s", srs_error_desc(err).c_str());
     }
 
@@ -1588,7 +1658,8 @@ srs_error_t SrsGbMuxer::on_ts_message(SrsTsMessage* msg)
         if ((err = on_ts_video(msg, &avs)) != srs_success) {
             return srs_error_wrap(err, "ts: consume video");
         }
-    } else {
+    }
+    else {
         if ((err = on_ts_audio(msg, &avs)) != srs_success) {
             return srs_error_wrap(err, "ts: consume audio");
         }
@@ -1628,7 +1699,7 @@ srs_error_t SrsGbMuxer::on_ts_video(SrsTsMessage* msg, SrsBuffer* avs)
         if (
             nt != SrsAvcNaluTypeSPS && nt != SrsAvcNaluTypePPS && nt != SrsAvcNaluTypeIDR &&
             nt != SrsAvcNaluTypeNonIDR && nt != SrsAvcNaluTypeSEI && nt != SrsAvcNaluTypeAccessUnitDelimiter
-        ) {
+            ) {
             string bytes = srs_string_dumps_hex(frame, frame_size, 4);
             srs_warn("GB: Ignore NALU nt=%d, frame=[%s]", nt, bytes.c_str());
             return err;
@@ -1858,7 +1929,7 @@ srs_error_t SrsGbMuxer::rtmp_write_packet(char type, uint32_t timestamp, char* d
 
         if (pprint_->can_print()) {
             srs_trace("Muxer: send msg %s age=%d, dts=%" PRId64 ", size=%d",
-                      msg->is_audio()? "A":msg->is_video()? "V":"N", pprint_->age(), msg->timestamp, msg->size);
+                msg->is_audio() ? "A" : msg->is_video() ? "V" : "N", pprint_->age(), msg->timestamp, msg->size);
         }
 
         // send out encoded msg.
@@ -1946,6 +2017,47 @@ srs_error_t SrsSipRequestWriter::build_first_line(std::stringstream& ss, char* d
     return srs_success;
 }
 
+namespace
+{
+
+}
+
+ISrsSipHandler::ISrsSipHandler()
+{
+}
+
+ISrsSipHandler::~ISrsSipHandler()
+{
+}
+
+SrsSipAuth::SrsSipAuth() : impl_{ new SrsRfc2617Auth() }
+{
+}
+
+SrsSipAuth::~SrsSipAuth()
+{
+    srs_freep(impl_);
+}
+
+srs_error_t SrsSipAuth::initialize(bool enabled, std::string realm, std::string htdigest_file)
+{
+    return impl_->initialize(enabled, realm, htdigest_file);
+}
+
+srs_error_t SrsSipAuth::serve_sip(SrsSipMessage* m, ISrsHttpMessage* r)
+{
+    std::string www_authenticate;
+    srs_error_t err = srs_success;
+
+    if ((err = impl_->do_auth(r, www_authenticate)) != srs_success) {
+        srs_error("do_auth %s", srs_error_desc(err).c_str());
+    }
+
+    m->www_authenticate_ = std::move(www_authenticate);
+
+    return err;
+}
+
 SrsSipMessage::SrsSipMessage()
 {
     method_ = HTTP_GET;
@@ -2008,13 +2120,17 @@ srs_error_t SrsSipMessage::parse(ISrsHttpMessage* m)
     type_ = (http_parser_type)m->message_type();
     if (type_ == HTTP_REQUEST) {
         // Parse request line.
-        method_ = (http_method) m->method();
+        method_ = (http_method)m->method();
         request_uri_ = srs_string_trim_start(m->path(), "/");
         srs_sip_parse_address(request_uri_, request_uri_user_, request_uri_host_);
-    } else if (type_ == HTTP_RESPONSE) {
+        authorization_ = m->header()->get("Authorization");
+    }
+    else if (type_ == HTTP_RESPONSE) {
         // Parse status line for response.
         status_ = (http_status)m->status_code();
-    } else {
+        www_authenticate_ = m->header()->get("WWW-Authenticate");
+    }
+    else {
         return srs_error_new(ERROR_GB_SIP_HEADER, "Invalid message type=%d", type_);
     }
 
@@ -2099,9 +2215,11 @@ srs_error_t SrsSipMessage::parse_via(const std::string& via)
 
     if (srs_string_starts_with(via, "SIP/2.0/TCP")) {
         via_transport_ = "TCP";
-    } else if (srs_string_starts_with(via, "SIP/2.0/UDP")) {
+    }
+    else if (srs_string_starts_with(via, "SIP/2.0/UDP")) {
         via_transport_ = "UDP";
-    } else {
+    }
+    else {
         return srs_error_new(ERROR_GB_SIP_HEADER, "Via transport invalid");
     }
 
@@ -2118,7 +2236,8 @@ srs_error_t SrsSipMessage::parse_via(const std::string& via)
         string param = params[i];
         if (srs_string_starts_with(param, "rport")) {
             via_rport_ = param;
-        } else if (srs_string_starts_with(param, "branch")) {
+        }
+        else if (srs_string_starts_with(param, "branch")) {
             via_branch_ = param;
         }
     }
@@ -2131,7 +2250,7 @@ srs_error_t SrsSipMessage::parse_via(const std::string& via)
     if (via_branch_.empty()) return srs_error_new(ERROR_GB_SIP_HEADER, "Via no branch");
     // The branch ID inserted by an element compliant with this specification MUST always begin with the characters
     // "z9hG4bK". See https://www.ietf.org/rfc/rfc3261.html#section-8.1.1.7
-    if (!srs_string_starts_with(via_branch_, string("branch=")+SRS_GB_BRANCH_MAGIC)) {
+    if (!srs_string_starts_with(via_branch_, string("branch=") + SRS_GB_BRANCH_MAGIC)) {
         return srs_error_new(ERROR_GB_SIP_HEADER, "Invalid branch=%s", via_branch_.c_str());
     }
 
@@ -2446,11 +2565,14 @@ bool srs_skip_util_pack(SrsBuffer* stream)
         // When searching pack header from payload, mostly not zero.
         if (p[0] != 0x00 && p[1] != 0x00 && p[2] != 0x00 && p[3] != 0x00) {
             stream->skip(4);
-        } else if (p[0] != 0x00 && p[1] != 0x00 && p[2] != 0x00) {
+        }
+        else if (p[0] != 0x00 && p[1] != 0x00 && p[2] != 0x00) {
             stream->skip(3);
-        } else if (p[0] != 0x00 && p[1] != 0x00) {
+        }
+        else if (p[0] != 0x00 && p[1] != 0x00) {
             stream->skip(2);
-        } else {
+        }
+        else {
             if (p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01 && p[3] == 0xba) {
                 return true;
             }
@@ -2485,4 +2607,3 @@ void srs_sip_parse_address(const std::string& address, std::string& user, std::s
 }
 
 SrsResourceManager* _srs_gb_manager = NULL;
-
